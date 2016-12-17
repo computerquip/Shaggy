@@ -7,9 +7,12 @@ set(CMAKE_C_STANDARD 11)
 
 find_package(SDL2 REQUIRED)
 find_package(GLEW REQUIRED)
-find_package(GLM REQUIRED)
 
-set(SOURCE_FILES src/main.c)
+set(SOURCE_FILES
+        src/main.c
+        src/sclog4c.c
+        src/slre.c)
+
 add_executable(Shaggy ${SOURCE_FILES})
 
 set(POSIX_LIBRARIES m)
