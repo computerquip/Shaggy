@@ -1,23 +1,12 @@
 #include "sclog4c/sclog4c.h"
+#include "khash.h"
 #include "tinydir.h"
-#include "hashmap.h"
 #include "slre.h"
 #include <stdio.h>
 
 /**********
  * Utility
  **********/
-
-// http://www.cse.yorku.ca/~oz/hash.html
-static uint64_t djb2(const char *str, size_t length) {
-	unsigned long hash = 5381;
-	char c;
-	for (int i = 0; i < length; ++i) {
-		c = *(str + i);
-		hash = ((hash << 5) + hash) + c;
-	}
-	return hash;
-}
 
 /*******************
  * Eventually, this will also support
@@ -27,15 +16,25 @@ static uint64_t djb2(const char *str, size_t length) {
  * Type Definitions
  * One per shader type
  ***************************/
-#define \
-    shader_type(T) \
-    typedef GLuint shaggy_##T;
+enum shaggy_shader_type {
+	SHAGGY_VERTEX_SHADER,
+	SHAGGY_FRAGMENT_SHADER,
+	SHAGGY_TESS_CONTROL_SHADER,
+	SHAGGY_TESS_EVALUATION_SHADER,
+	SHAGGY_GEOMETRY_SHADER
+};
 
-shader_type(vertex_shader);
-shader_type(tess_control_shader);
-shader_type(tess_evaluation_shader);
-shader_type(geometry_shader);
-shader_type(fragment_shader);
+#define \
+    shader_type(T)         \
+    typedef struct {       \
+        GLuint shader;     \
+    } shaggy_##T##_shader; \
+
+shader_type(vertex);
+shader_type(tess_control);
+shader_type(tess_evaluation);
+shader_type(geometry);
+shader_type(fragment);
 
 /****************************
  * Shader Creation Functions
@@ -44,19 +43,19 @@ shader_type(fragment_shader);
 
 #define \
     shader_create(Type, Enum) \
-    shaggy_##Type shaggy_create_##Type (void) { \
-        return glCreateShader(Enum); \
+    shaggy_##Type##_shader shaggy_create_##Type##_shader (void) { \
+        return (shaggy_##Type##_shader){ glCreateShader(Enum) }; \
     }
 
-shader_create(vertex_shader, GL_VERTEX_SHADER);
+shader_create(vertex, GL_VERTEX_SHADER);
 
-shader_create(tess_control_shader, GL_TESS_CONTROL_SHADER);
+shader_create(tess_control, GL_TESS_CONTROL_SHADER);
 
-shader_create(tess_evaluation_shader, GL_TESS_EVALUATION_SHADER);
+shader_create(tess_evaluation, GL_TESS_EVALUATION_SHADER);
 
-shader_create(geometry_shader, GL_GEOMETRY_SHADER);
+shader_create(geometry, GL_GEOMETRY_SHADER);
 
-shader_create(fragment_shader, GL_FRAGMENT_SHADER);
+shader_create(fragment, GL_FRAGMENT_SHADER);
 
 /*************************
  * Platform-specific Code
@@ -68,6 +67,7 @@ shader_create(fragment_shader, GL_FRAGMENT_SHADER);
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 
 /***********************************************************************************
  * Load shader source into the shader via a file.
@@ -75,24 +75,24 @@ shader_create(fragment_shader, GL_FRAGMENT_SHADER);
  * @param file File to obtain source for said shader.
  * @todo Only works with POSIX for now since we virtually map the file using mmap.
  ***********************************************************************************/
-void shaggy_source_shader_from_file(GLuint shader, const char *file) {
+bool shaggy_source_shader_from_file(GLuint shader, const char *file) {
 	struct stat source_stat;
 	int source_fd;
 	int error;
 	size_t length;
 	char *source;
+	bool result = false;
 
 	source_fd = open(file, O_RDONLY);
-
 	if (source_fd == -1) {
-		logm(ERROR, strerror(errno));
-		return;
+		logm(ERROR, "Failed to open() file: %s", strerror(errno));
+		return result;
 	}
 
-	error = fstat(source, &source_stat);
+	error = fstat(source_fd, &source_stat);
 	if (error == -1) {
-		logm(ERROR, strerror(errno));
-		return;
+		logm(ERROR, "fstat() failed: %s", strerror(errno));
+		return result;
 	}
 
 	if (!S_ISREG(source_stat.st_mode)) {
@@ -100,18 +100,26 @@ void shaggy_source_shader_from_file(GLuint shader, const char *file) {
 		goto fail;
 	}
 
-	source = mmap(0, source_stat.st_size, PROT_READ, MAP_PRIVATE, source_fd, 0);
-	if (source == MAP_FAILED) {
-		logm(ERROR, strerror(errno));
+	if (source_stat.st_size == 0) {
+		logm(WARNING, "File %s is of size 0!", file);
 		goto fail;
 	}
 
-	glShaderSource(shader, 1, (const GLchar * const*)&source, &source_stat.st_size);
+	source = mmap(0, source_stat.st_size, PROT_READ, MAP_PRIVATE, source_fd, 0);
+	if (source == MAP_FAILED) {
+		logm(ERROR, "mmap() failed: %s", strerror(errno));
+		goto fail;
+	}
+
+	glShaderSource(shader, 1, (const GLchar *const *) &source, (const GLint *) &source_stat.st_size);
 
 	munmap(source, source_stat.st_size);
 
+	result = true;
+
 fail:
 	close(source_fd);
+	return result;
 }
 
 #elif _WIN32
@@ -140,11 +148,12 @@ void _print_windows_error() {
 	LocalFree(lpMsgBuf);
 }
 
-void shaggy_source_shader_from_file(GLuint shader, const char *file) {
+bool shaggy_source_shader_from_file(GLuint shader, const char *file) {
 	HANDLE source;
 	DWORD source_size = 0;
 	HANDLE source_map;
 	LPVOID source_map_view;
+	bool result = false;
 
 	source = CreateFile(file,
 						GENERIC_READ,
@@ -156,7 +165,7 @@ void shaggy_source_shader_from_file(GLuint shader, const char *file) {
 
 	if (source == INVALID_HANDLE_VALUE) {
 		_print_windows_error();
-		return;
+		return result;
 	}
 
 	source_size = GetFileSize(source, 0);
@@ -185,6 +194,7 @@ void shaggy_source_shader_from_file(GLuint shader, const char *file) {
 
 	logm(WARNING, "%s", source_map_view);
 	glShaderSource(shader, 1, (const GLchar *const *) &source_map_view, (const GLint *) &source_size);
+	result = true;
 
 	UnmapViewOfFile(source_map_view);
 
@@ -193,6 +203,7 @@ void shaggy_source_shader_from_file(GLuint shader, const char *file) {
 
 	fail_map:
 	CloseHandle(source);
+	return result;
 }
 
 #endif
@@ -290,33 +301,73 @@ void shaggy_delete_program(shaggy_program program) {
  * It will stay in memory until you explicitly remove the shader or kill the managed object.
  * Programs must still be explicitly defined. Perhaps a spec input later.
  **************************************************************************/
-struct shader_hm_entry {
-	uint64_t hash;
-	GLint shader;
-};
 
-DEFINE_HASHMAP(shader_hm, struct shader_hm_entry);
-#define SHADER_CMP(left, right) (left->hash == right->hash)
-#define SHADER_HASH(entry) entry->hash
-DECLARE_HASHMAP(shader_hm, SHADER_CMP, SHADER_HASH, free, realloc);
+KHASH_MAP_INIT_STR(shader_map, GLint)
 
 struct shaggy_manager {
-	shader_hm vertex_shader_map;
-	shader_hm fragment_shader_map;
+	khash_t(shader_map) *vertex_shader_map;
+	khash_t(shader_map) *fragment_shader_map;
 };
 
 static inline
 struct shaggy_manager *shaggy_create_shader_manager(void) {
-	struct shaggy_manager *manager = calloc(1, sizeof(struct shaggy_manager));
+	struct shaggy_manager *manager = malloc(sizeof(struct shaggy_manager));
 
-	shader_hmNew(&manager->vertex_shader_map);
-	shader_hmNew(&manager->fragment_shader_map);
+	manager->vertex_shader_map = kh_init(shader_map);
+	manager->fragment_shader_map = kh_init(shader_map);
+
+	return manager;
 }
 
 static inline
 void shaggy_destroy_shader_manager(struct shaggy_manager *manager) {
+	kh_destroy(shader_map, manager->vertex_shader_map);
+	kh_destroy(shader_map, manager->fragment_shader_map);
 	free(manager);
 }
+
+#define shaggy_manage_add_shader(manager, name, shader) _Generic((shader),         \
+        shaggy_vertex_shader: shaggy_manage_add_vertex_shader,                     \
+        shaggy_fragment_shader: shaggy_manage_add_fragment_shader                  \
+    ) (manager, name, shader)
+
+
+#define shader_hash_impl(T)                                                                             \
+static inline                                                                                           \
+void shaggy_manage_add_##T##_shader(                                                                    \
+struct shaggy_manager *manager, const char *name, shaggy_##T##_shader shader) {                         \
+    int ret;                                                                                            \
+    khiter_t iter;                                                                                      \
+    khash_t(shader_map) *map = manager->T##_shader_map;                                                 \
+                                                                                                        \
+    iter = kh_put(shader_map, map, name, &ret);                                                         \
+    if (ret == -1) {                                                                                    \
+        logm(ERROR, "Failed to create key %s in shader hash table!", name);                             \
+    }                                                                                                   \
+                                                                                                        \
+    logm(INFO, "Added %s to the " #T " shader hash table!", name);                                      \
+    kh_val(map, iter) = shader.shader;                                                                  \
+                                                                                                        \
+}                                                                                                       \
+                                                                                                        \
+static inline                                                                                           \
+shaggy_##T##_shader                                                                                     \
+shaggy_manage_fetch_##T##_shader(struct shaggy_manager *manager, const char *shader_name) {             \
+    khiter_t iter;                                                                                      \
+    khash_t(shader_map) *map = manager->T##_shader_map;                                                 \
+                                                                                                        \
+    iter = kh_get(shader_map, map, shader_name);                                                        \
+    if (iter == kh_end(map)) {                                                                          \
+        logm(WARNING, "Failed to find key %s in shader hash table!", shader_name);                      \
+        return (shaggy_##T##_shader) { 0 };                                                             \
+    }                                                                                                   \
+                                                                                                        \
+    return (shaggy_##T##_shader) { kh_value(map, iter) };                                               \
+}
+
+shader_hash_impl(fragment)
+
+shader_hash_impl(vertex)
 
 static inline
 void shaggy_manage_shader_file(struct shaggy_manager *manager, const char *pathname) {
@@ -325,7 +376,7 @@ void shaggy_manage_shader_file(struct shaggy_manager *manager, const char *pathn
 	int error;
 	struct slre_cap caps[2];
 	tinydir_file file;
-	const char *regexp = "(^[a-zA-Z0-9\\.]*)\\.(vert|frag)\\.glsl";
+	const char *filename_exp = "(^[a-zA-Z0-9\\.]*)\\.(vert|frag)\\.glsl";
 
 	GLint shader = 0; /* Resulting shader */
 
@@ -341,31 +392,34 @@ void shaggy_manage_shader_file(struct shaggy_manager *manager, const char *pathn
 	}
 
 	name_length = strlen(file.name);
-	bytes_scanned = slre_match(regexp, file.name, name_length, caps, 2, SLRE_IGNORE_CASE);
+	bytes_scanned = slre_match(filename_exp, file.name, name_length, caps, 2, SLRE_IGNORE_CASE);
 
 	if (bytes_scanned < 0 || bytes_scanned != name_length) {
 		logm(WARNING, "File %s didn't match a valid shaggy shader file name.", file.name);
 		return;
 	}
 
-	logm(INFO, "Filename %s - Captures: %.*s %.*s",
-		 file.name,
-		 caps[0].len, caps[0].ptr,
-		 caps[1].len, caps[1].ptr);
-
 	/*******************************
 	 * Compile the shader and stuff
 	 *******************************/
-	if (strncmp("frag", caps[1].ptr, caps[1].len)) {
-		shader = shaggy_create_fragment_shader();
-	} else if (strncmp("vert", caps[1].ptr, caps[1].len)) {
-		shader = shaggy_create_vertex_shader();
-	} else {
-		logm(ERROR, "Unknown shader type. This should never happen!");
+	bytes_scanned = slre_match("frag", caps[1].ptr, caps[1].len, 0, 0, SLRE_IGNORE_CASE);
+	if (bytes_scanned == caps[1].len) {
+		shader = shaggy_create_fragment_shader().shader;
+		goto regex_done;
+	}
+
+	bytes_scanned = slre_match("vert", caps[1].ptr, caps[1].len, 0, 0, SLRE_IGNORE_CASE);
+	if (bytes_scanned == caps[1].len) {
+		shader = shaggy_create_vertex_shader().shader;
+		goto regex_done;
+	}
+
+	regex_done:
+
+	if (!shaggy_source_shader_from_file(shader, file.path)) {
 		return;
 	}
 
-	shaggy_source_shader_from_file(shader, file.path);
 	shaggy_compile_shader(shader);
 	{
 		GLint status = shaggy_check_shader_compile_status(shader);
@@ -383,12 +437,16 @@ void shaggy_manage_shader_file(struct shaggy_manager *manager, const char *pathn
 	 * Add shader to hashmap so we can
 	 * query by shader file name.
 	 **********************************/
-	struct shader_hm_entry entry = {djb2(caps[0].ptr, caps[0].len), shader};
-	struct shader_hm_entry *pEntry = &entry;
+	bytes_scanned = slre_match("vert", caps[1].ptr, caps[1].len, 0, 0, SLRE_IGNORE_CASE);
+	if (bytes_scanned == caps[1].len) {
+		shaggy_manage_add_shader(manager, strndup(caps[0].ptr, caps[0].len), (shaggy_fragment_shader) {shader});
+		return;
+	}
 
-	HashMapPutResult result = shader_hmPut(&manager->fragment_shader_map, &pEntry, HMDR_FIND);
-	if (result == HMPR_FOUND) {
-		logm(WARNING, "Shader %s already exists!", file.name);
+	bytes_scanned = slre_match("frag", caps[1].ptr, caps[1].len, 0, 0, SLRE_IGNORE_CASE);
+	if (bytes_scanned == caps[1].len) {
+		shaggy_manage_add_shader(manager, strndup(caps[0].ptr, caps[0].len), (shaggy_vertex_shader) {shader});
+		return;
 	}
 }
 
@@ -409,20 +467,42 @@ void shaggy_manage_shader_dir(struct shaggy_manager *manager, const char *dir_pa
 	tinydir_close(&dir);
 }
 
-#define fetch_shader_func(T) \
-static inline                                                                                        \
-shaggy_##T##_shader shaggy_manage_fetch_##T##_shader(struct shaggy_manager *manager, const char *shader_name) { \
-    struct shader_hm_entry entry = { djb2(shader_name, strlen(shader_name)), 0 };                    \
-    struct shader_hm_entry *pEntry = &entry;                                                         \
-    bool found = false;                                                                              \
-                                                                                                     \
-    found = shader_hmFind(&manager->T##_shader_map, &pEntry);                                        \
-                                                                                                     \
-    if (found == false) {                                                                            \
-        logm(WARNING, "Failed to find shader %s.", shader_name);                                     \
-    }                                                                                                \
+static inline
+shaggy_program shaggy_manage_build_program(struct shaggy_manager *manager, const char *shaders[5]) {
+	GLint status;
+	shaggy_program program = shaggy_create_program();
+
+	GLuint shader = shaggy_manage_fetch_vertex_shader(manager, shaders[SHAGGY_VERTEX_SHADER]).shader;
+	if (!shader) {
+		logm(WARNING, "Failed to fetch vertex shader %s", shaders[SHAGGY_VERTEX_SHADER]);
+	} else {
+		shaggy_attach_shader(program, shader);
+	}
+
+	shader = shaggy_manage_fetch_fragment_shader(manager, shaders[SHAGGY_FRAGMENT_SHADER]).shader;
+	if (!shader) {
+		logm(WARNING, "Failed to fetch vertex shader %s", shaders[SHAGGY_FRAGMENT_SHADER]);
+	} else {
+		shaggy_attach_shader(program, shader);
+	}
+
+	/*********************************************
+	 * TODO Various other steps can be taken here
+	 * Will implement as they come along
+	 *********************************************/
+
+	shaggy_link_program(program);
+
+	status = shaggy_check_program_link_status(program);
+	if (status == GL_FALSE) {
+		GLsizei buf_size = shaggy_get_program_info_log_length(program);
+		GLchar buf[buf_size];
+
+		shaggy_get_program_info_log(program, buf_size, buf);
+		logm(WARNING, "Failed to link program: %.*s", buf_size, buf);
+		shaggy_delete_program(program);
+		program = 0;
+	}
+
+	return program;
 }
-
-fetch_shader_func(fragment)
-
-fetch_shader_func(vertex)

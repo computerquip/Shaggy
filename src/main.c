@@ -170,6 +170,13 @@ int main(int argc, char *argv[]) {
 	shaggy_manage_shader_dir(shader_manager, "../shaders");
 	shaggy_fragment_shader temp_shader = shaggy_manage_fetch_fragment_shader(shader_manager, "basic");
 	shaggy_fragment_shader temp_shader2 = shaggy_manage_fetch_fragment_shader(shader_manager, "basic2");
+
+	shaggy_program program = shaggy_manage_build_program(
+			shader_manager,
+			(const char *[5]) {
+					"basic", "basic"
+			}
+	);
 #endif
 
 	/**************************
